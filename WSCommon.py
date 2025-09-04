@@ -1,34 +1,14 @@
 import asyncio, json, inspect
 import websockets
 
-import asyncio, json, inspect
-import websockets
-
 class WSClient:
-	def __init__(
-		self,
-		url: str,
-		*,
-		subprotocols=None,
-		ping_interval=0.5,
-		ping_timeout=1.0,
-		open_timeout=1.0,
-		close_timeout=1.0,
-		reconnect_backoff=(0.5, 5.0)
-	):
+	def __init__(self, url: str, *, subprotocols=None, ping_interval=20):
 		self.url = url
 		self.subprotocols = subprotocols
 		self.ping_interval = ping_interval
-		self.ping_timeout = ping_timeout
-		self.open_timeout = open_timeout
-		self.close_timeout = close_timeout
-		self.min_backoff, self.max_backoff = reconnect_backoff
-
 		self._ws = None
+		self._recv_task = None
 		self._listeners = {"*": set()}
-		self._runner_task = None
-		self._stop = False
-		self._ready = asyncio.Event()
 
 	def on(self, event: str):
 		def decorator(handler_coro):
@@ -36,109 +16,38 @@ class WSClient:
 			return handler_coro
 		return decorator
 
-	@property
-	def connected(self) -> bool:
-		return self._ws is not None and not self._ws.closed
-
-	async def start(self):
-		# Idempotent: ensure a single runner
-		if self._runner_task and not self._runner_task.done():
-			return
-		self._stop = False
-		self._runner_task = asyncio.create_task(self._runner())
-
 	async def connect(self):
-		# Backwards-compat: start() now owns reconnect; connect() just calls start() and waits once
-		await self.start()
-		await self.wait_until_ready(timeout=self.open_timeout)
+		self._ws = await websockets.connect(self.url, subprotocols=self.subprotocols, ping_interval=self.ping_interval)
+		self._recv_task = asyncio.create_task(self._receiver())
 
 	async def close(self, code=1000, reason="bye"):
-		self._stop = True
-		try:
-			if self._ws:
-				await self._ws.close(code=code, reason=reason)
-		except Exception:
-			pass
-		if self._runner_task:
-			self._runner_task.cancel()
-
-	async def wait_until_ready(self, timeout: float | None = None) -> bool:
-		try:
-			await asyncio.wait_for(self._ready.wait(), timeout)
-		except asyncio.TimeoutError:
-			return False
-		return self._ready.is_set()
+		if self._ws:
+			await self._ws.close(code=code, reason=reason)
+		if self._recv_task:
+			self._recv_task.cancel()
 
 	async def send_json(self, obj: dict):
-		if not self.connected:
-			ok = await self.wait_until_ready(timeout=1.0)
-			if not ok:
-				raise ConnectionError("WebSocket not connected")
 		await self._ws.send(json.dumps(obj))
 
 	async def send_binary(self, data: bytes):
-		if not self.connected:
-			ok = await self.wait_until_ready(timeout=1.0)
-			if not ok:
-				raise ConnectionError("WebSocket not connected")
 		await self._ws.send(data)
 
-	async def _runner(self):
-		backoff = self.min_backoff
-		while not self._stop:
-			try:
-				self._ws = await websockets.connect(
-					self.url,
-					subprotocols=self.subprotocols,
-					ping_interval=self.ping_interval,
-					ping_timeout=self.ping_timeout,
-					open_timeout=self.open_timeout,
-					close_timeout=self.close_timeout,
-					max_queue=32
-				)
-				self._ready.set()
-				# Optional: emit "connect" to listeners that care
-				await self._emit("connect", {"ok": True})
-
-				# Receiver loop
-				try:
-					async for msg in self._ws:
-						if isinstance(msg, str):
-							try:
-								obj = json.loads(msg)
-							except Exception:
-								# invalid JSON ignored (protocol expects JSON-only for text)
-								continue
-							await self._emit("json", obj)
-						else:
-							await self._emit("binary", msg)
-				finally:
-					# Drop through to reconnect on any exit
-					pass
-
-			except websockets.ConnectionClosedOK:
-				# Normal closure; likely stop requested
-				pass
-			except websockets.ConnectionClosedError as e:
-				print(f"[client] connection closed with error: {e.code} {e.reason}")
-			except Exception as e:
-				print(f"[client] connect/recv error: {e}")
-
-			# Teardown & notify
-			if self._ws:
-				try:
-					await self._ws.close()
-				except Exception:
-					pass
-			self._ws = None
-			self._ready.clear()
-			await self._emit("disconnect", {"reason": "reconnect"})
-
-			# Reconnect after short backoff (unless stopping)
-			if self._stop:
-				break
-			await asyncio.sleep(backoff)
-			backoff = min(backoff * 2, self.max_backoff)
+	async def _receiver(self):
+		try:
+			async for msg in self._ws:
+				if isinstance(msg, str):
+					try:
+						obj = json.loads(msg)
+					except Exception as e:
+						# invalid JSON ignored (protocol expects JSON-only for text)
+						continue
+					await self._emit("json", obj)
+				else:
+					await self._emit("binary", msg)
+		except websockets.ConnectionClosedOK:
+			pass
+		except websockets.ConnectionClosedError as e:
+			print(f"[client] connection closed with error: {e.code} {e.reason}")
 
 	async def _emit(self, event: str, payload):
 		for h in list(self._listeners.get("*", ())):
