@@ -1,8 +1,7 @@
-import asyncio, json, inspect
-import websockets
+import asyncio, json, inspect, websockets
 
 class WSClient:
-	def __init__(self, url: str, *, subprotocols=None, heartbeat_interval=0.25, heartbeat_timeout=1.0, reconnect_initial=0.25, reconnect_max=1.0):
+	def __init__(self, url: str, *, subprotocols=None, heartbeat_interval=1, heartbeat_timeout=8.0, reconnect_initial=0.25, reconnect_max=1.0):
 		self.url = url
 		self.subprotocols = subprotocols
 
@@ -202,12 +201,26 @@ class WSClient:
 		except Exception as e:
 			print(f"[client] handler error: {e}")
 
-
 class WSServer:
-	def __init__(self, host: str = "127.0.0.1", port: int = 8765, *, ping_interval=20):
+	def __init__(
+		self,
+		host: str = "127.0.0.1",
+		port: int = 8765,
+		*,
+		ping_interval: float = 1.0,
+		ping_timeout: float = 8.0,
+		close_timeout: float = 0.5,
+		max_size: int | None = 2**23, # 8mb
+	):
 		self.host = host
 		self.port = int(port)
-		self.ping_interval = ping_interval
+
+		# Heartbeat + close controls
+		self.ping_interval = float(ping_interval)
+		self.ping_timeout  = float(ping_timeout)
+		self.close_timeout = float(close_timeout)
+		self.max_size = max_size
+
 		self._listeners = {"*": set()}
 		self._conns = set()
 		self._tasks = set()
@@ -233,13 +246,23 @@ class WSServer:
 		if self._server:
 			return
 		self._stopped.clear()
-		self._server = await websockets.serve(self._handle_conn, self.host, self.port, ping_interval=self.ping_interval)
-		print(f"WS server running at {self.endpoint()}")
+
+		self._server = await websockets.serve(
+			self._handle_conn,
+			self.host,
+			self.port,
+			ping_interval=self.ping_interval,   # how often server pings
+			ping_timeout=self.ping_timeout,     # wait for pong before drop
+			close_timeout=self.close_timeout,   # graceful close wait
+			max_size=self.max_size,             # optional size limit
+		)
+		print(f"WS server running at {self.endpoint()} "
+		      f"(ping_interval={self.ping_interval}s, "
+		      f"ping_timeout={self.ping_timeout}s)")
 
 	async def stop(self):
 		if not self._server:
 			return
-		# Close listeners first
 		for ws in list(self._conns):
 			try:
 				await ws.close(code=1001, reason="server-shutdown")
