@@ -256,9 +256,7 @@ class WSServer:
 			close_timeout=self.close_timeout,   # graceful close wait
 			max_size=self.max_size,             # optional size limit
 		)
-		print(f"WS server running at {self.endpoint()} "
-		      f"(ping_interval={self.ping_interval}s, "
-		      f"ping_timeout={self.ping_timeout}s)")
+		print(f"WS server running at {self.endpoint()}")
 
 	async def stop(self):
 		if not self._server:
