@@ -99,11 +99,11 @@ class WSClient:
 					try:
 						_ = t.result()
 					except Exception as e:
-						# print(f"[client] task ended with error: {e}")
+						print(f"[client] task ended with error: {e}")
 
 			except Exception as e:
 				await self._emit("disconnect", None)
-				# print(f"[client] connect/run error: {e}")
+				print(f"[client] connect/run error: {e}")
 
 			# Cleanup after disconnect
 			self._ready_evt.clear()
@@ -131,7 +131,7 @@ class WSClient:
 			await self._ws.send(payload)
 		except Exception as e:
 			# Force a reconnect by closing; sender will wait on _wait_connected again
-			# print(f"[client] send error, forcing reconnect: {e}")
+			print(f"[client] send error, forcing reconnect: {e}")
 			try:
 				await self._ws.close(code=1011, reason="send-error")
 			except Exception:
@@ -153,7 +153,7 @@ class WSClient:
 		except websockets.ConnectionClosedOK:
 			pass
 		except websockets.ConnectionClosedError as e:
-			# print(f"[client] connection closed with error: {e.code} {e.reason}")
+			print(f"[client] connection closed with error: {e.code} {e.reason}")
 		finally:
 			# Returning will let _run() reconnect
 			return
@@ -171,7 +171,7 @@ class WSClient:
 					ping = await self._ws.ping()
 					await asyncio.wait_for(ping, timeout=self.heartbeat_timeout)
 				except Exception as e:
-					# print(f"[client] heartbeat failed: {e}")
+					print(f"[client] heartbeat failed: {e}")
 					# Triggers reconnect via receiver/runner unwind
 					try:
 						await self._ws.close(code=1011, reason="heartbeat-timeout")
@@ -199,7 +199,7 @@ class WSClient:
 			else:
 				await handler_coro(args[-1])
 		except Exception as e:
-			# print(f"[client] handler error: {e}")
+			print(f"[client] handler error: {e}")
 
 class WSServer:
 	def __init__(
@@ -256,7 +256,7 @@ class WSServer:
 			close_timeout=self.close_timeout,   # graceful close wait
 			max_size=self.max_size,             # optional size limit
 		)
-		# print(f"WS server running at {self.endpoint()}")
+		print(f"WS server running at {self.endpoint()}")
 
 	async def stop(self):
 		if not self._server:
@@ -281,6 +281,12 @@ class WSServer:
 		msg = json.dumps(obj)
 		await asyncio.gather(*(ws.send(msg) for ws in list(self._conns)), return_exceptions=True)
 
+	async def broadcast_json_to(self, targets: list, obj: dict):
+		if not targets:
+			return
+		msg = json.dumps(obj)
+		await asyncio.gather(*(ws.send(msg) for ws in targets if ws.open), return_exceptions=True)
+
 	async def _handle_conn(self, ws):
 		self._conns.add(ws)
 		await self._emit("connect", ws, None)
@@ -298,7 +304,7 @@ class WSServer:
 		except websockets.ConnectionClosedOK:
 			pass
 		except websockets.ConnectionClosedError as e:
-			# print(f"[server] client closed with error: {e.code} {e.reason}")
+			print(f"[server] client closed with error: {e.code} {e.reason}")
 		finally:
 			await self._emit("disconnect", ws, None)
 			self._conns.discard(ws)
@@ -321,4 +327,4 @@ class WSServer:
 			else:
 				await handler_coro()
 		except Exception as e:
-			# print(f"[server] handler error: {e}")
+			print(f"[server] handler error: {e}")
