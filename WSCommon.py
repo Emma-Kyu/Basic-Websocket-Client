@@ -1,4 +1,6 @@
 import asyncio, json, inspect, websockets
+from websockets.exceptions import ConnectionClosedOK, ConnectionClosedError
+from websockets.protocol import State
 
 class WSClient:
 	def __init__(self, url: str, *, subprotocols=None, heartbeat_interval=1, heartbeat_timeout=8.0, reconnect_initial=0.25, reconnect_max=1.0):
@@ -34,20 +36,17 @@ class WSClient:
 		Returns once an initial connection is established (or raises).
 		"""
 		if self._runner and not self._runner.done():
-			# Already running: just wait for readiness.
 			await self._wait_connected()
 			return
 
 		self._closing = False
 		self._runner = asyncio.create_task(self._run())
-
-		# Wait until first successful connect (fast fail if it can't connect)
 		await self._wait_connected()
 
 	async def close(self, code=1000, reason="bye"):
 		self._closing = True
 		try:
-			if self._ws:
+			if self._ws and not self._ws.closed:
 				await self._ws.close(code=code, reason=reason)
 		except Exception:
 			pass
@@ -82,6 +81,9 @@ class WSClient:
 				self._ready_evt.set()
 				await self._emit("connect", None)
 
+				# Reset backoff after a successful connection.
+				backoff = self.reconnect_initial
+
 				# Start receiver + heartbeat
 				self._recv_task = asyncio.create_task(self._receiver())
 				self._hb_task = asyncio.create_task(self._heartbeat())
@@ -91,11 +93,9 @@ class WSClient:
 					{self._recv_task, self._hb_task},
 					return_when=asyncio.FIRST_COMPLETED
 				)
-				# Ensure both tasks are stopped
 				for t in pending:
 					t.cancel()
 				for t in done:
-					# surface exceptions for logging; loop will reconnect
 					try:
 						_ = t.result()
 					except Exception as e:
@@ -114,26 +114,27 @@ class WSClient:
 			if self._closing:
 				break
 
-			# Quick backoff, capped
 			await asyncio.sleep(backoff)
 			backoff = min(self.reconnect_max, max(self.reconnect_initial, backoff * 1.5))
 
 	async def _wait_connected(self):
 		while not self._closing:
-			if self._ws is not None:
+			if self._ws is not None and not self._ws.closed:
 				return
 			await self._ready_evt.wait()
-			if self._ws is not None:
+			if self._ws is not None and not self._ws.closed:
 				return
 
 	async def _safe_send(self, payload):
+		ws = self._ws
+		if ws is None or ws.closed or ws.state is not State.OPEN:
+			raise ConnectionError("websocket not open")
 		try:
-			await self._ws.send(payload)
+			await ws.send(payload)
 		except Exception as e:
-			# Force a reconnect by closing; sender will wait on _wait_connected again
 			print(f"[client] send error, forcing reconnect: {e}")
 			try:
-				await self._ws.close(code=1011, reason="send-error")
+				await ws.close(code=1011, reason="send-error")
 			except Exception:
 				pass
 			raise
@@ -145,17 +146,15 @@ class WSClient:
 					try:
 						obj = json.loads(msg)
 					except Exception:
-						# invalid JSON ignored (protocol expects JSON-only for text)
 						continue
 					await self._emit("json", obj)
 				else:
 					await self._emit("binary", msg)
-		except websockets.ConnectionClosedOK:
+		except ConnectionClosedOK:
 			pass
-		except websockets.ConnectionClosedError as e:
+		except ConnectionClosedError as e:
 			print(f"[client] connection closed with error: {e.code} {e.reason}")
 		finally:
-			# Returning will let _run() reconnect
 			return
 
 	async def _heartbeat(self):
@@ -164,15 +163,13 @@ class WSClient:
 		"""
 		try:
 			while True:
-				# If socket got swapped out, exit so runner restarts a fresh HB task
 				if self._ws is None:
 					return
 				try:
-					ping = await self._ws.ping()
-					await asyncio.wait_for(ping, timeout=self.heartbeat_timeout)
+					pong_waiter = self._ws.ping()
+					await asyncio.wait_for(pong_waiter, timeout=self.heartbeat_timeout)
 				except Exception as e:
 					print(f"[client] heartbeat failed: {e}")
-					# Triggers reconnect via receiver/runner unwind
 					try:
 						await self._ws.close(code=1011, reason="heartbeat-timeout")
 					except Exception:
@@ -200,6 +197,7 @@ class WSClient:
 				await handler_coro(args[-1])
 		except Exception as e:
 			print(f"[client] handler error: {e}")
+
 
 class WSServer:
 	def __init__(
@@ -251,10 +249,10 @@ class WSServer:
 			self._handle_conn,
 			self.host,
 			self.port,
-			ping_interval=self.ping_interval,   # how often server pings
-			ping_timeout=self.ping_timeout,     # wait for pong before drop
-			close_timeout=self.close_timeout,   # graceful close wait
-			max_size=self.max_size,             # optional size limit
+			ping_interval=self.ping_interval,
+			ping_timeout=self.ping_timeout,
+			close_timeout=self.close_timeout,
+			max_size=self.max_size,
 		)
 		print(f"WS server running at {self.endpoint()}")
 
@@ -263,7 +261,8 @@ class WSServer:
 			return
 		for ws in list(self._conns):
 			try:
-				await ws.close(code=1001, reason="server-shutdown")
+				if not ws.closed:
+					await ws.close(code=1001, reason="server-shutdown")
 			except Exception:
 				pass
 		self._server.close()
@@ -272,20 +271,30 @@ class WSServer:
 		self._stopped.set()
 
 	async def send_json(self, ws, obj: dict):
+		if ws.closed or ws.state is not State.OPEN:
+			return
 		await ws.send(json.dumps(obj))
 
 	async def send_binary(self, ws, data: bytes):
+		if ws.closed or ws.state is not State.OPEN:
+			return
 		await ws.send(data)
 
 	async def broadcast_json(self, obj: dict):
 		msg = json.dumps(obj)
-		await asyncio.gather(*(ws.send(msg) for ws in list(self._conns)), return_exceptions=True)
+		await asyncio.gather(
+			*(ws.send(msg) for ws in list(self._conns) if not ws.closed and ws.state is State.OPEN),
+			return_exceptions=True
+		)
 
 	async def broadcast_json_to(self, targets: list, obj: dict):
 		if not targets:
 			return
 		msg = json.dumps(obj)
-		await asyncio.gather(*(ws.send(msg) for ws in targets if ws.open), return_exceptions=True)
+		await asyncio.gather(
+			*(ws.send(msg) for ws in targets if not ws.closed and ws.state is State.OPEN),
+			return_exceptions=True
+		)
 
 	async def _handle_conn(self, ws):
 		self._conns.add(ws)
@@ -301,9 +310,9 @@ class WSServer:
 					await self._emit("json", ws, obj)
 				else:
 					await self._emit("binary", ws, msg)
-		except websockets.ConnectionClosedOK:
+		except ConnectionClosedOK:
 			pass
-		except websockets.ConnectionClosedError as e:
+		except ConnectionClosedError as e:
 			print(f"[server] client closed with error: {e.code} {e.reason}")
 		finally:
 			await self._emit("disconnect", ws, None)
